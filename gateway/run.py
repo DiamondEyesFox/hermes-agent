@@ -845,7 +845,7 @@ class GatewayRunner:
         _known_commands = {"new", "reset", "help", "status", "stop", "model",
                           "personality", "retry", "undo", "sethome", "set-home",
                           "compress", "usage", "insights", "reload-mcp", "reload_mcp",
-                          "update", "title", "resume", "provider", "rollback",
+                          "update", "title", "resume", "restore", "provider", "rollback",
                           "background"}
         if command and command in _known_commands:
             await self.hooks.emit(f"command:{command}", {
@@ -905,6 +905,9 @@ class GatewayRunner:
 
         if command == "resume":
             return await self._handle_resume_command(event)
+
+        if command == "restore":
+            return await self._handle_restore_command(event)
 
         if command == "rollback":
             return await self._handle_rollback_command(event)
@@ -1541,6 +1544,7 @@ class GatewayRunner:
             "`/compress` — Compress conversation context",
             "`/title [name]` — Set or show the session title",
             "`/resume [name]` — Resume a previously-named session",
+            "`/restore [session_id]` — Import tail-focused context from a prior session",
             "`/usage` — Show token usage for this session",
             "`/insights [days]` — Show usage insights and analytics",
             "`/rollback [number]` — List or restore filesystem checkpoints",
@@ -2335,6 +2339,244 @@ class GatewayRunner:
         msg_part = f" ({msg_count} message{'s' if msg_count != 1 else ''})" if msg_count else ""
 
         return f"↻ Resumed session **{title}**{msg_part}. Conversation restored."
+
+    def _get_restore_sessions_dir(self) -> Path:
+        """Return the directory containing structured session JSON logs."""
+        sessions_dir = getattr(self.config, "sessions_dir", None)
+        if sessions_dir:
+            return Path(sessions_dir)
+        return _hermes_home / "sessions"
+
+    @staticmethod
+    def _parse_tool_arguments(raw_args: Any) -> Dict[str, Any]:
+        """Parse tool-call arguments into a dict when possible."""
+        if isinstance(raw_args, dict):
+            return raw_args
+        if not isinstance(raw_args, str) or not raw_args.strip():
+            return {}
+        try:
+            import json as _json
+            parsed = _json.loads(raw_args)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _parse_tool_result(raw_content: Any) -> Dict[str, Any]:
+        """Parse a tool result payload when it is JSON."""
+        if isinstance(raw_content, dict):
+            return raw_content
+        if not isinstance(raw_content, str) or not raw_content.strip():
+            return {}
+        try:
+            import json as _json
+            parsed = _json.loads(raw_content)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _shorten_restore_text(text: Any, limit: int = 140) -> str:
+        """Normalize and trim free-form text for restore summaries."""
+        if text is None:
+            return ""
+        cleaned = re.sub(r"\s+", " ", str(text)).strip()
+        if len(cleaned) <= limit:
+            return cleaned
+        return cleaned[: max(0, limit - 3)].rstrip() + "..."
+
+    def _find_restore_source_file(self, current_session_id: str, target_session_id: str = "") -> Optional[Path]:
+        """Locate the session JSON to restore from.
+
+        Defaults to the most recent previous structured session record, excluding
+        the current session.
+        """
+        sessions_dir = self._get_restore_sessions_dir()
+        if target_session_id:
+            target = sessions_dir / f"session_{target_session_id}.json"
+            return target if target.exists() else None
+
+        candidates: List[Path] = []
+        for path in sessions_dir.glob("session_*.json"):
+            name = path.name
+            if name.startswith("session_cron_") or name.startswith("sessions"):
+                continue
+            if current_session_id and name == f"session_{current_session_id}.json":
+                continue
+            candidates.append(path)
+
+        def _sort_key(path: Path):
+            try:
+                return path.stat().st_mtime
+            except Exception:
+                return 0.0
+
+        for path in sorted(candidates, key=_sort_key, reverse=True):
+            try:
+                import json as _json
+                data = _json.loads(path.read_text(encoding="utf-8"))
+                if data.get("messages"):
+                    return path
+            except Exception:
+                continue
+        return None
+
+    def _build_restore_summary_from_session_record(self, record: Dict[str, Any], *, tail_messages: int = 40) -> Dict[str, Any]:
+        """Build a tail-focused restore summary from a structured session record."""
+        messages = record.get("messages") or []
+        tail = messages[-tail_messages:] if tail_messages > 0 else messages
+
+        tool_call_index: Dict[str, Dict[str, Any]] = {}
+        for msg in tail:
+            if msg.get("role") != "assistant":
+                continue
+            for call in msg.get("tool_calls") or []:
+                function = call.get("function") or {}
+                call_id = call.get("call_id") or call.get("id")
+                if not call_id:
+                    continue
+                tool_call_index[call_id] = {
+                    "name": function.get("name", "tool"),
+                    "arguments": self._parse_tool_arguments(function.get("arguments")),
+                }
+
+        recent_user_all = [
+            self._shorten_restore_text(msg.get("content"), 180)
+            for msg in tail
+            if msg.get("role") == "user" and self._shorten_restore_text(msg.get("content"), 180)
+        ]
+        recent_assistant_all = [
+            self._shorten_restore_text(msg.get("content"), 220)
+            for msg in tail
+            if msg.get("role") == "assistant" and self._shorten_restore_text(msg.get("content"), 220)
+        ]
+
+        # Tail-focused by default: use only the latest request/state when the
+        # session window is short, and broaden slightly only when there is a
+        # richer active tail to preserve.
+        recent_user = recent_user_all[-2:] if len(recent_user_all) > 2 else recent_user_all[-1:]
+        recent_assistant = recent_assistant_all[-2:] if len(recent_assistant_all) > 2 else recent_assistant_all[-1:]
+
+        unfinished_todos: List[str] = []
+        recent_tools: List[str] = []
+        for msg in reversed(tail):
+            if msg.get("role") != "tool":
+                continue
+            call_meta = tool_call_index.get(msg.get("tool_call_id") or "", {})
+            tool_name = call_meta.get("name", "tool")
+            tool_args = call_meta.get("arguments", {})
+            parsed = self._parse_tool_result(msg.get("content"))
+
+            if tool_name == "todo" and not unfinished_todos:
+                for item in parsed.get("todos") or []:
+                    if item.get("status") in {"pending", "in_progress"}:
+                        content = self._shorten_restore_text(item.get("content"), 120)
+                        if content:
+                            unfinished_todos.append(content)
+                continue
+
+            if len(recent_tools) >= 5:
+                continue
+
+            snippet = ""
+            if tool_name == "terminal":
+                cmd = self._shorten_restore_text(tool_args.get("command"), 90)
+                output = self._shorten_restore_text(parsed.get("output"), 100)
+                snippet = f"terminal: {cmd}" + (f" -> {output}" if output else "")
+            elif tool_name == "patch":
+                path = self._shorten_restore_text(tool_args.get("path"), 90)
+                snippet = f"patch: {path}" if path else "patch applied"
+            elif tool_name == "read_file":
+                path = self._shorten_restore_text(tool_args.get("path"), 90)
+                snippet = f"read_file: {path}" if path else "read_file"
+            elif tool_name == "search_files":
+                pattern = self._shorten_restore_text(tool_args.get("pattern"), 90)
+                snippet = f"search_files: {pattern}" if pattern else "search_files"
+            elif tool_name == "browser_navigate":
+                url = self._shorten_restore_text(tool_args.get("url"), 90)
+                snippet = f"browser_navigate: {url}" if url else "browser_navigate"
+            elif tool_name != "todo":
+                snippet = tool_name
+
+            if snippet:
+                recent_tools.append(snippet)
+
+        lines = [
+            f"[Restored tail context from previous session {record.get('session_id', 'unknown')}]",
+        ]
+
+        if recent_user:
+            lines.append("Recent user requests:")
+            lines.extend(f"- {item}" for item in recent_user)
+
+        if recent_assistant:
+            lines.append("Latest assistant state:")
+            lines.extend(f"- {item}" for item in recent_assistant)
+
+        if unfinished_todos:
+            lines.append("Unfinished work:")
+            lines.extend(f"- {item}" for item in unfinished_todos)
+
+        if recent_tools:
+            lines.append("Recent tool activity:")
+            lines.extend(f"- {item}" for item in reversed(recent_tools))
+
+        if unfinished_todos:
+            lines.append("Continue from the unfinished work above.")
+        elif recent_user:
+            lines.append("Continue from the latest active request above.")
+
+        return {
+            "summary": "\n".join(lines),
+            "unfinished_todos": unfinished_todos,
+            "recent_user": recent_user,
+            "recent_assistant": recent_assistant,
+        }
+
+    async def _handle_restore_command(self, event: MessageEvent) -> str:
+        """Handle /restore command — import tail-focused context from a prior session."""
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        current_session_id = session_entry.session_id
+        target_session_id = event.get_command_args().strip()
+
+        source_file = self._find_restore_source_file(current_session_id, target_session_id)
+        if not source_file:
+            if target_session_id:
+                return f"No session record found for `{target_session_id}`."
+            return (
+                "No previous session record found to restore from.\n"
+                "Start a conversation first, then /restore will import the latest prior context into this new session."
+            )
+
+        try:
+            import json as _json
+            record = _json.loads(source_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.debug("Failed to read restore source %s: %s", source_file, e)
+            return f"Could not read restore source session: {e}"
+
+        restore = self._build_restore_summary_from_session_record(record)
+        summary = restore.get("summary", "")
+        restore_message = {"role": "assistant", "content": summary}
+        self.session_store.append_to_transcript(current_session_id, restore_message)
+
+        if restore.get("unfinished_todos"):
+            continue_prompt = (
+                "Continue from the restored tail context and resume the unfinished work. "
+                "Do not ask the user to repeat themselves. If the next action is obvious, do it now."
+            )
+            continue_event = MessageEvent(
+                text=continue_prompt,
+                message_type=MessageType.TEXT,
+                source=source,
+            )
+            return await self._handle_message(continue_event)
+
+        return (
+            f"♻️ Context restored from previous session `{record.get('session_id', 'unknown')}`.\n\n"
+            f"{summary}"
+        )
 
     async def _handle_usage_command(self, event: MessageEvent) -> str:
         """Handle /usage command -- show token usage for the session's last agent run."""

@@ -650,6 +650,17 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("Discord followup failed: %s", e)
 
+        @tree.command(name="restore", description="Import previous-session context into this session")
+        @discord.app_commands.describe(session_id="Optional session ID to restore from. Leave empty for the latest prior session.")
+        async def slash_restore(interaction: discord.Interaction, session_id: str = ""):
+            await interaction.response.defer(ephemeral=True)
+            event = self._build_slash_event(interaction, f"/restore {session_id}".strip())
+            await self.handle_message(event)
+            try:
+                await interaction.followup.send("Done~", ephemeral=True)
+            except Exception as e:
+                logger.debug("Discord followup failed: %s", e)
+
         @tree.command(name="usage", description="Show token usage for this session")
         async def slash_usage(interaction: discord.Interaction):
             await interaction.response.defer(ephemeral=True)

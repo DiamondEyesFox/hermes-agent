@@ -168,6 +168,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     BotCommand("compress", "Compress conversation context"),
                     BotCommand("title", "Set or show the session title"),
                     BotCommand("resume", "Resume a previously-named session"),
+                    BotCommand("restore", "Import previous-session context into this session"),
                     BotCommand("usage", "Show token usage for this session"),
                     BotCommand("provider", "Show available providers"),
                     BotCommand("insights", "Show usage insights and analytics"),
